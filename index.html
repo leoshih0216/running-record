@@ -173,7 +173,7 @@
   <div class="card ocr-card" id="ocrTrigger">
     <div class="ico">📷</div>
     <div class="title">從圖片匯入</div>
-    <div class="desc">上傳 Strava 截圖（摘要 / 分段）自動填入欄位</div>
+    <div class="desc">上傳 Strava 截圖（摘要 / 分段）。<br/>分段表建議裁成「公里+配速」「海拔+心率」兩張上傳，辨識最準</div>
   </div>
   <input type="file" id="ocrFile" accept="image/*" multiple style="display:none;" />
   <div class="card ocr-progress" id="ocrProgress">
@@ -1104,6 +1104,86 @@ function parseActivityTime(text) {
   return null;
 }
 
+// 影像分類：判斷是否為「公里+配速」或「海拔+心率」單欄裁切圖
+function classifySplitsImage(text) {
+  // 標題鄰近度：「公里」「配速」相距 ≤15 字元才視為欄位標題
+  const isKmPaceHdr = /公\s*里[^\n]{0,15}配\s*速|配\s*速[^\n]{0,15}公\s*里/.test(text);
+  const isElevHrHdr = /海\s*拔[^\n]{0,15}心\s*率|心\s*率[^\n]{0,15}海\s*拔/.test(text);
+  if (isKmPaceHdr && !isElevHrHdr) return 'km_pace';
+  if (isElevHrHdr && !isKmPaceHdr) return 'elev_hr';
+  if (isKmPaceHdr && isElevHrHdr) return 'splits_full';
+  return null;
+}
+
+// 單欄解析：km# + pace（裁切圖每行只有兩欄）
+function parseKmPaceColumn(text) {
+  const lines = text.split(/\r?\n/);
+  const rows = [];
+  for (const line of lines) {
+    const tokens = [];
+    const re = /(\d{1,2}:[0-5]\d)|(-?\d+)/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (m[1]) {
+        const [a, b] = m[1].split(':').map(Number);
+        tokens.push({ type: 'pace', sec: a * 60 + b });
+      } else {
+        const raw = m[2], v = parseInt(raw, 10);
+        if (raw[0] !== '-' && (raw.length === 3 || raw.length === 4) && v >= 300 && v <= 1559) {
+          const mm = Math.floor(v / 100), ss = v % 100;
+          if (mm >= 3 && mm <= 15 && ss <= 59) {
+            tokens.push({ type: 'pace', sec: mm * 60 + ss });
+            continue;
+          }
+        }
+        tokens.push({ type: 'int', val: v });
+      }
+    }
+    let km = null, pace = null;
+    for (const t of tokens) {
+      if (km === null && t.type === 'int' && t.val >= 1 && t.val <= 99) km = t.val;
+      else if (pace === null && t.type === 'pace') pace = t.sec;
+    }
+    if (km !== null && pace !== null) rows.push({ km, pace });
+  }
+  // 依 km 排序去重
+  const seen = new Set();
+  const uniq = [];
+  rows.sort((a, b) => a.km - b.km);
+  for (const r of rows) {
+    if (seen.has(r.km)) continue;
+    seen.add(r.km);
+    uniq.push(r);
+  }
+  return uniq;
+}
+
+// 單欄解析：海拔 + 心率（裁切圖每行只有兩欄）
+function parseElevHrColumn(text) {
+  const lines = text.split(/\r?\n/);
+  const rows = [];
+  for (const line of lines) {
+    const ints = [];
+    const re = /(-?\d{1,3})/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      ints.push(parseInt(m[1], 10));
+    }
+    if (ints.length === 0) continue;
+    // 心率取行尾且在 50-230 範圍的整數，海拔取其前一個
+    let hr = null, elev = null;
+    for (let i = ints.length - 1; i >= 0; i--) {
+      if (ints[i] >= 50 && ints[i] <= 230) {
+        hr = ints[i];
+        if (i - 1 >= 0 && Math.abs(ints[i - 1]) <= 999) elev = ints[i - 1];
+        break;
+      }
+    }
+    if (hr !== null) rows.push({ elev, hr });
+  }
+  return rows;
+}
+
 // 解析分段表。Strava OCR 常見問題：
 //  1. 冒號被吃掉：「7:30」→「730」、「7:02」→「702」
 //  2. 心率被拆碎：「157」→「1 17」
@@ -1208,16 +1288,54 @@ async function runOcr(files) {
   try {
     const worker = await getOcrWorker();
     let combinedText = '';
-    let allSplits = [];
+    const results = []; // 每張圖的分類與解析結果
     for (let i = 0; i < files.length; i++) {
       setOcrLabel(`辨識第 ${i+1}/${files.length} 張…`);
       $('#ocrBar').style.width = '0%';
       const canvas = await preprocessImage(files[i]);
       const { data: { text } } = await worker.recognize(canvas);
       combinedText += '\n' + text;
-      const splits = parseSplits(text);
-      if (splits.length > allSplits.length) allSplits = splits;
+      const cls = classifySplitsImage(text);
+      if (cls === 'km_pace') {
+        results.push({ type: 'km_pace', rows: parseKmPaceColumn(text) });
+      } else if (cls === 'elev_hr') {
+        results.push({ type: 'elev_hr', rows: parseElevHrColumn(text) });
+      } else {
+        // splits_full / 摘要 / 未分類，全部交給通用解析器
+        results.push({ type: 'other', splits: parseSplits(text) });
+      }
     }
+
+    // 合併分段資料
+    let allSplits = [];
+    const kp = results.find(r => r.type === 'km_pace');
+    const eh = results.find(r => r.type === 'elev_hr');
+    if (kp && eh) {
+      // 兩張裁切圖：依列順序合併
+      const n = Math.min(kp.rows.length, eh.rows.length);
+      for (let i = 0; i < n; i++) {
+        allSplits.push({
+          km: kp.rows[i].km,
+          pace: kp.rows[i].pace,
+          elevDelta: eh.rows[i].elev,
+          hr: eh.rows[i].hr,
+        });
+      }
+      // km/pace 列數較多時，多出的部分以 null 補齊
+      for (let i = n; i < kp.rows.length; i++) {
+        allSplits.push({ km: kp.rows[i].km, pace: kp.rows[i].pace, elevDelta: null, hr: null });
+      }
+    } else {
+      // 從通用解析器中取最多列的結果
+      for (const r of results) {
+        if (r.splits && r.splits.length > allSplits.length) allSplits = r.splits;
+      }
+      // 只有 km_pace 半張時，仍給出 pace（無心率/海拔）
+      if (kp && allSplits.length === 0) {
+        allSplits = kp.rows.map(r => ({ km: r.km, pace: r.pace, elevDelta: null, hr: null }));
+      }
+    }
+
     const summary = parseSummary(combinedText);
     showOcrProgress(false);
     showOcrPreview({ ...summary, splits: allSplits, rawText: combinedText });
