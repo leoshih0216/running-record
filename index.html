@@ -1141,15 +1141,24 @@ function classifySplitsImage(text) {
   return null;
 }
 
+// 預先剔除「1:14:07」h:mm:ss、「上午/下午 H:MM」等非分段時間
+function stripNonSplitTimes(text) {
+  return text
+    .replace(/\d{1,2}:\d{2}:\d{2}/g, ' ')
+    .replace(/(?:上\s*午|下\s*午|早\s*上|晚\s*上|凌\s*晨|AM|PM|am|pm)\s*\d{1,2}:\d{2}/g, ' ');
+}
+
 // 單欄解析：km# + pace。保留部分成功的行（只有 km 或只有 pace）
-// 以維持與 elev/hr 半張的列序對齊。不排序、不去重。
+// 以維持與 elev/hr 半張的列序對齊。
 function parseKmPaceColumn(text) {
-  const lines = text.split(/\r?\n/);
+  const cleaned = stripNonSplitTimes(text);
+  const lines = cleaned.split(/\r?\n/);
   const rows = [];
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (!/\d/.test(line)) continue; // 純文字標題行（公里 配速 / 分段）跳過
+    if (!/\d/.test(line)) continue;
+    if (/[一-龥]/.test(line)) continue; // 含中文 = 摘要/標題行，跳過避免誤抓
 
     const tokens = [];
     const re = /(\d{1,2}:[0-5]\d)|(-?\d+)/g;
@@ -1157,7 +1166,8 @@ function parseKmPaceColumn(text) {
     while ((m = re.exec(line)) !== null) {
       if (m[1]) {
         const [a, b] = m[1].split(':').map(Number);
-        tokens.push({ type: 'pace', sec: a * 60 + b });
+        if (a >= 2 && a <= 15) tokens.push({ type: 'pace', sec: a * 60 + b });
+        // 範圍外的 m:ss 不入列
       } else {
         const raw = m[2], v = parseInt(raw, 10);
         if (raw[0] !== '-' && (raw.length === 3 || raw.length === 4) && v >= 300 && v <= 1559) {
@@ -1175,20 +1185,21 @@ function parseKmPaceColumn(text) {
       if (km === null && t.type === 'int' && t.val >= 1 && t.val <= 99) km = t.val;
       else if (pace === null && t.type === 'pace') pace = t.sec;
     }
-    // 至少有一個欄位才當資料行；保留 OCR 順序便於對列合併
     if (km !== null || pace !== null) rows.push({ km, pace });
   }
   return rows;
 }
 
-// 單欄解析：海拔 + 心率。同樣保留部分成功的行。
+// 單欄解析：海拔 + 心率。必須抓到 HR 才入列，否則略過（避免假行偏移）。
 function parseElevHrColumn(text) {
-  const lines = text.split(/\r?\n/);
+  const cleaned = stripNonSplitTimes(text);
+  const lines = cleaned.split(/\r?\n/);
   const rows = [];
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (!/\d/.test(line)) continue; // 標題行跳過
+    if (!/\d/.test(line)) continue;
+    if (/[一-龥]/.test(line)) continue; // 含中文 = 摘要/標題行，跳過
 
     const ints = [];
     const re = /(-?\d{1,3})/g;
@@ -1206,12 +1217,7 @@ function parseElevHrColumn(text) {
         break;
       }
     }
-    // 若沒抓到 HR，但有單一非 HR 範圍的整數，視為 elev-only（仍佔位以保持列序）
-    if (hr === null) {
-      const v = ints[ints.length - 1];
-      if (Math.abs(v) <= 999 && (v < 50 || v > 230)) elev = v;
-    }
-    if (hr !== null || elev !== null) rows.push({ elev, hr });
+    if (hr !== null) rows.push({ elev, hr });
   }
   return rows;
 }
@@ -1320,35 +1326,36 @@ async function runOcr(files) {
   try {
     const worker = await getOcrWorker();
     let combinedText = '';
-    const results = []; // 每張圖的分類與解析結果
+    const allKpRows = [];
+    const allEhRows = [];
+    let parseSplitsBest = []; // 全表（每行四欄）情境的退路
+
     for (let i = 0; i < files.length; i++) {
       setOcrLabel(`辨識第 ${i+1}/${files.length} 張…`);
       $('#ocrBar').style.width = '0%';
       const canvas = await preprocessImage(files[i]);
       const { data: { text } } = await worker.recognize(canvas);
       combinedText += '\n' + text;
-      const cls = classifySplitsImage(text);
-      if (cls === 'km_pace') {
-        results.push({ type: 'km_pace', rows: parseKmPaceColumn(text) });
-      } else if (cls === 'elev_hr') {
-        results.push({ type: 'elev_hr', rows: parseElevHrColumn(text) });
-      } else {
-        // splits_full / 摘要 / 未分類，全部交給通用解析器
-        results.push({ type: 'other', splits: parseSplits(text) });
-      }
+
+      // 每張圖都同時跑兩個解析器，按出現順序累積。
+      // 摘要圖兩個都會回 0 列（含中文行被過濾），不會干擾。
+      const kpRows = parseKmPaceColumn(text);
+      const ehRows = parseElevHrColumn(text);
+      allKpRows.push(...kpRows);
+      allEhRows.push(...ehRows);
+
+      const generalSplits = parseSplits(text);
+      if (generalSplits.length > parseSplitsBest.length) parseSplitsBest = generalSplits;
     }
 
-    // 合併分段資料
+    // 決定最終分段
     let allSplits = [];
-    const kp = results.find(r => r.type === 'km_pace');
-    const eh = results.find(r => r.type === 'elev_hr');
-    if (kp && eh) {
-      // 兩張裁切圖依列序對齊。取行數較多的一邊為長度，缺項補 null。
-      // km# 永遠用列序（1,2,3...），OCR 抓到的 km 多半被誤讀（3→5 等）
-      const n = Math.max(kp.rows.length, eh.rows.length);
+    if (allKpRows.length >= 3 && allEhRows.length >= 3) {
+      // 兩種半張資料都有 → 依出現順序合併
+      const n = Math.max(allKpRows.length, allEhRows.length);
       for (let i = 0; i < n; i++) {
-        const a = kp.rows[i] || {};
-        const b = eh.rows[i] || {};
+        const a = allKpRows[i] || {};
+        const b = allEhRows[i] || {};
         allSplits.push({
           km: i + 1,
           pace: a.pace != null ? a.pace : null,
@@ -1356,29 +1363,25 @@ async function runOcr(files) {
           hr: b.hr != null ? b.hr : null,
         });
       }
-    } else {
-      // 從通用解析器中取最多列的結果
-      for (const r of results) {
-        if (r.splits && r.splits.length > allSplits.length) allSplits = r.splits;
-      }
-      // 只有 km_pace 半張時，仍給出 pace（無心率/海拔）
-      if (kp && allSplits.length === 0) {
-        allSplits = kp.rows.map((r, i) => ({
-          km: r.km != null ? r.km : (i + 1),
-          pace: r.pace,
-          elevDelta: null,
-          hr: null,
-        }));
-      }
-      // 只有 elev_hr 半張時，先填 km 由列序，pace 留 null
-      if (eh && !kp && allSplits.length === 0) {
-        allSplits = eh.rows.map((r, i) => ({
-          km: i + 1,
-          pace: null,
-          elevDelta: r.elev,
-          hr: r.hr,
-        }));
-      }
+    } else if (parseSplitsBest.length >= 3) {
+      // 退路：通用每行四欄解析器
+      allSplits = parseSplitsBest;
+    } else if (allKpRows.length >= 3) {
+      // 只有 km/pace
+      allSplits = allKpRows.map((r, i) => ({
+        km: i + 1,
+        pace: r.pace,
+        elevDelta: null,
+        hr: null,
+      }));
+    } else if (allEhRows.length >= 3) {
+      // 只有 elev/hr
+      allSplits = allEhRows.map((r, i) => ({
+        km: i + 1,
+        pace: null,
+        elevDelta: r.elev,
+        hr: r.hr,
+      }));
     }
 
     const summary = parseSummary(combinedText);

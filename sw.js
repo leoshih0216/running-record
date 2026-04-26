@@ -1,4 +1,4 @@
-const CACHE = 'jog-v8';
+const CACHE = 'jog-v9';
 const ASSETS = [
   './',
   './index.html',
