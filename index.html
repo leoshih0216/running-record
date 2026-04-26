@@ -170,13 +170,13 @@
     </div>
   </div>
 
-  <div class="card ocr-card" id="ocrTrigger">
+  <div class="card ocr-card" id="ocrTrigger" style="display:none;">
     <div class="ico">📷</div>
     <div class="title">從圖片匯入</div>
-    <div class="desc">上傳 Strava 截圖（摘要 / 分段）。<br/>分段表建議裁成「公里+配速」「海拔+心率」兩張上傳，辨識最準</div>
+    <div class="desc">上傳 Strava 截圖辨識（暫停使用）</div>
   </div>
   <input type="file" id="ocrFile" accept="image/*" multiple style="display:none;" />
-  <div class="card ocr-progress" id="ocrProgress">
+  <div class="card ocr-progress" id="ocrProgress" style="display:none;">
     <div class="label" id="ocrLabel">載入辨識引擎…</div>
     <div class="progress-bar"><div id="ocrBar"></div></div>
   </div>
@@ -237,6 +237,7 @@
           </table>
           <div class="splits-actions">
             <button type="button" class="ghost" id="addSplit">＋ 加一段</button>
+            <button type="button" class="ghost" id="bulkSplits">📋 批次貼上</button>
             <button type="button" class="ghost" id="clearSplits">清空</button>
           </div>
         </div>
@@ -337,6 +338,34 @@
     </p>
   </div>
 </section>
+
+<!-- ===== 批次貼上 Modal ===== -->
+<div class="modal-bg" id="bulkModal">
+  <div class="modal">
+    <div class="close-bar">
+      <h3>批次貼上分段</h3>
+      <button class="ghost" id="bulkClose">✕</button>
+    </div>
+    <div class="hint">
+      每行一段，欄位以空格分隔。支援以下格式：<br/>
+      <code style="color:var(--accent);">配速</code>　例：<code>7:30</code><br/>
+      <code style="color:var(--accent);">配速 心率</code>　例：<code>7:30 151</code><br/>
+      <code style="color:var(--accent);">配速 海拔 心率</code>　例：<code>7:30 -5 151</code><br/>
+      <code style="color:var(--accent);">km# 配速 海拔 心率</code>　例：<code>1 7:30 -5 151</code>（km# 會被忽略，依列序自動編號）
+    </div>
+    <textarea id="bulkText" rows="12" placeholder="7:30 -5 151
+7:02 -1 157
+7:00 5 156
+7:19 4 158
+7:11 0 156
+7:35 -3 156
+7:26 -2 157
+7:41 -4 160
+7:39 3 162
+7:43 1 162" style="font-family:ui-monospace, Menlo, Consolas, monospace; font-size:14px;"></textarea>
+    <button type="button" class="primary" id="bulkApply" style="margin-top:8px;">✓ 套用</button>
+  </div>
+</div>
 
 <!-- ===== OCR 預覽 Modal ===== -->
 <div class="modal-bg" id="ocrModal">
@@ -739,6 +768,51 @@ function renderSplits() {
   }
 }
 
+function parseBulkSplits(text) {
+  const lines = text.split(/\r?\n/);
+  const rows = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/[一-龥]/.test(line)) continue;
+
+    const tokens = [];
+    const re = /(\d{1,2}:[0-5]\d)|(-?\d+)/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (m[1]) {
+        const [a, b] = m[1].split(':').map(Number);
+        if (a >= 2 && a <= 15) tokens.push({ type: 'pace', sec: a * 60 + b });
+      } else {
+        const raw = m[2], v = parseInt(raw, 10);
+        if (raw[0] !== '-' && (raw.length === 3 || raw.length === 4) && v >= 300 && v <= 1559) {
+          const mm = Math.floor(v / 100), ss = v % 100;
+          if (mm >= 3 && mm <= 15 && ss <= 59) {
+            tokens.push({ type: 'pace', sec: mm * 60 + ss });
+            continue;
+          }
+        }
+        tokens.push({ type: 'int', val: v });
+      }
+    }
+
+    const paceIdx = tokens.findIndex(t => t.type === 'pace');
+    if (paceIdx < 0) continue;
+    const pace = tokens[paceIdx].sec;
+    const intsAfter = tokens.slice(paceIdx + 1).filter(t => t.type === 'int').map(t => t.val);
+    let elev = null, hr = null;
+    if (intsAfter.length >= 2) {
+      hr = intsAfter[intsAfter.length - 1];
+      elev = intsAfter[intsAfter.length - 2];
+    } else if (intsAfter.length === 1) {
+      const v = intsAfter[0];
+      if (v >= 50 && v <= 230) hr = v; else elev = v;
+    }
+    rows.push({ pace, elev, hr });
+  }
+  return rows;
+}
+
 function setupSplits() {
   $('#splitsToggle').addEventListener('click', () => {
     $('#splitsBody').classList.toggle('open');
@@ -751,6 +825,32 @@ function setupSplits() {
   $('#clearSplits').addEventListener('click', () => {
     if (splitsState.length === 0) return;
     if (confirm('清空所有分段？')) { splitsState = []; renderSplits(); }
+  });
+
+  // 批次貼上
+  $('#bulkSplits').addEventListener('click', () => {
+    $('#bulkText').value = '';
+    $('#bulkModal').classList.add('show');
+    setTimeout(() => $('#bulkText').focus(), 50);
+  });
+  $('#bulkClose').addEventListener('click', () => $('#bulkModal').classList.remove('show'));
+  $('#bulkModal').addEventListener('click', e => {
+    if (e.target === $('#bulkModal')) $('#bulkModal').classList.remove('show');
+  });
+  $('#bulkApply').addEventListener('click', () => {
+    const txt = $('#bulkText').value.trim();
+    if (!txt) return showToast('請先貼上資料', 'error');
+    const rows = parseBulkSplits(txt);
+    if (rows.length === 0) return showToast('沒有解析出有效資料', 'error');
+    splitsState = rows.map((r, i) => ({
+      km: i + 1,
+      pace: r.pace,
+      elevDelta: r.elev,
+      hr: r.hr,
+    }));
+    renderSplits();
+    $('#bulkModal').classList.remove('show');
+    showToast(`已匯入 ${rows.length} 段`);
   });
   $('#splitsRows').addEventListener('input', e => {
     const tr = e.target.closest('tr');
