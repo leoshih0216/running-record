@@ -968,8 +968,8 @@ let ocrWorker = null;
 
 async function getOcrWorker() {
   if (ocrWorker) return ocrWorker;
-  setOcrLabel('下載辨識引擎（首次約 5MB，會快取）…');
-  ocrWorker = await Tesseract.createWorker('eng', 1, {
+  setOcrLabel('下載辨識引擎（首次約 12MB 含中文，會快取）…');
+  ocrWorker = await Tesseract.createWorker(['chi_tra', 'eng'], 1, {
     logger: m => {
       if (m.status && m.progress != null) {
         $('#ocrBar').style.width = Math.round(m.progress * 100) + '%';
@@ -1012,74 +1012,162 @@ async function preprocessImage(file) {
   return canvas;
 }
 
-// 解析摘要圖（圖2）：距離、配速、移動時間、爬升、平均心率、最高
+// 解析摘要圖：距離、配速、移動時間、爬升、平均心率、最高、時間、路線
 function parseSummary(text) {
   const out = {};
   // 距離：第一個 \d+\.\d{1,2} 數字
   const distAll = [...text.matchAll(/(\d+\.\d{1,2})/g)].map(m => parseFloat(m[1]));
   if (distAll.length > 0) {
-    // Strava 距離通常是兩位小數的 km，取 0.5 ~ 200 之間第一個
     const d = distAll.find(v => v >= 0.5 && v <= 200);
     if (d != null) out.distance = d;
   }
-  // 配速：m:ss 模式，緊接 /公里 或位於合理範圍 3:00-15:00
-  const paceCandidates = [...text.matchAll(/\b([2-9]|1[0-5]):([0-5]\d)\b/g)];
-  if (paceCandidates.length > 0) {
-    const sec = parseInt(paceCandidates[0][1], 10) * 60 + parseInt(paceCandidates[0][2], 10);
-    out.pace = sec;
-  }
-  // 移動時間：h:mm:ss 或 m:ss > 15:00
+  // 移動時間：h:mm:ss
   const hms = text.match(/\b(\d{1,2}):(\d{2}):(\d{2})\b/);
   if (hms) {
     out.duration = parseInt(hms[1],10)*3600 + parseInt(hms[2],10)*60 + parseInt(hms[3],10);
-  } else if (out.pace && out.distance) {
+  }
+  // 平均配速：m:ss 在 /公里 附近，或合理範圍 3:00-15:00（避開時間 h:mm:ss）
+  // 先嘗試找「/公里」前的 m:ss
+  const paceWithUnit = text.match(/(\d{1,2}):([0-5]\d)\s*[\/／]\s*公?里?/);
+  if (paceWithUnit) {
+    out.pace = parseInt(paceWithUnit[1], 10) * 60 + parseInt(paceWithUnit[2], 10);
+  } else {
+    // 退而求其次：第一個 m:ss（排除已經是 hms 一部分的）
+    const paceCandidates = [...text.matchAll(/\b([2-9]|1[0-5]):([0-5]\d)\b(?!:)/g)];
+    if (paceCandidates.length > 0) {
+      out.pace = parseInt(paceCandidates[0][1], 10) * 60 + parseInt(paceCandidates[0][2], 10);
+    }
+  }
+  if (!out.duration && out.pace && out.distance) {
     out.duration = Math.round(out.pace * out.distance);
   }
-  // 心率：xxx bpm
+  // 平均心率：xxx bpm
   const hr = text.match(/(\d{2,3})\s*bpm/i);
   if (hr) out.avgHr = parseInt(hr[1], 10);
-  // 海拔：所有 \d+\s*公尺，取兩個最大者作為 max，較小者作為 gain
-  const meters = [...text.matchAll(/(\d+)\s*公尺/g)].map(m => parseInt(m[1], 10));
-  if (meters.length >= 2) {
-    const sorted = [...meters].sort((a, b) => a - b);
-    out.elevationGain = sorted[0];
-    out.maxElevation = sorted[sorted.length - 1];
-  } else if (meters.length === 1) {
-    out.elevationGain = meters[0];
+  // 海拔：所有 \d+\s*公尺，先找「爬升」「最高」字樣附近的數字
+  const elevGainCtx = text.match(/爬\s*升[^\d]{0,20}(\d{1,4})\s*公?\s*尺/);
+  const elevMaxCtx = text.match(/最\s*高[^\d]{0,20}(\d{1,4})\s*公?\s*尺/);
+  if (elevGainCtx) out.elevationGain = parseInt(elevGainCtx[1], 10);
+  if (elevMaxCtx) out.maxElevation = parseInt(elevMaxCtx[1], 10);
+  if (!out.elevationGain && !out.maxElevation) {
+    const meters = [...text.matchAll(/(\d+)\s*公\s*尺/g)].map(m => parseInt(m[1], 10));
+    if (meters.length >= 2) {
+      const sorted = [...meters].sort((a, b) => a - b);
+      out.elevationGain = sorted[0];
+      out.maxElevation = sorted[sorted.length - 1];
+    } else if (meters.length === 1) {
+      out.elevationGain = meters[0];
+    }
   }
+  // 活動時間：上午/下午 H:MM 轉 24 小時制
+  const tt = parseActivityTime(text);
+  if (tt) out.time = tt;
+  // 路線/地點：「· 龜山區, 桃園市」這類中文行政區
+  const loc = text.match(/[·•・\-]\s*([一-龥]{1,8}(?:區|鄉|鎮|市|縣)(?:\s*[,，]\s*[一-龥]{1,8}(?:市|縣))?)/);
+  if (loc) out.route = loc[1].replace(/\s+/g, '').replace(/，/g, ', ');
   return out;
 }
 
-// 解析分段表（圖1）：每行 km# pace [bar] elevDelta hr
+function parseActivityTime(text) {
+  // 下午 / 晚上 → PM
+  const pmCN = text.match(/(?:下\s*午|晚\s*上)\s*(\d{1,2}):(\d{2})/);
+  if (pmCN) {
+    let h = parseInt(pmCN[1], 10); const m = parseInt(pmCN[2], 10);
+    if (h !== 12) h += 12;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+  }
+  const pmEN = text.match(/(\d{1,2}):(\d{2})\s*(?:PM|pm)/);
+  if (pmEN) {
+    let h = parseInt(pmEN[1], 10); const m = parseInt(pmEN[2], 10);
+    if (h !== 12) h += 12;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+  }
+  // 上午 / 早上 / 凌晨 → AM
+  const amCN = text.match(/(?:上\s*午|早\s*上|凌\s*晨)\s*(\d{1,2}):(\d{2})/);
+  if (amCN) {
+    let h = parseInt(amCN[1], 10); const m = parseInt(amCN[2], 10);
+    if (h === 12) h = 0;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+  }
+  const amEN = text.match(/(\d{1,2}):(\d{2})\s*(?:AM|am)/);
+  if (amEN) {
+    let h = parseInt(amEN[1], 10); const m = parseInt(amEN[2], 10);
+    if (h === 12) h = 0;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+  }
+  return null;
+}
+
+// 解析分段表：token 掃描法。OCR 對表格常拆行/夾雜雜訊，直接抽出
+// 所有「m:ss」與「整數」依出現順序，再用「km# 必須連續 1,2,3...」鎖定行界。
 function parseSplits(text) {
-  const lines = text.split(/\r?\n/);
-  const rows = [];
-  for (const line of lines) {
-    // 去掉非必要字元，找出 4 個關鍵欄位：km#, m:ss, 海拔(可負), HR
-    const cleaned = line.replace(/[^\d:\-\s.]/g, ' ').replace(/\s+/g, ' ').trim();
-    // 模式：起頭數字（公里序號 1-99），m:ss 配速，可正負海拔變化，HR(60-220)
-    const m = cleaned.match(/^(\d{1,2})\s+(\d{1,2}):([0-5]\d)\s+(-?\d{1,3})\s+(\d{2,3})$/);
-    if (m) {
-      const km = parseInt(m[1], 10);
-      const pace = parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
-      const elev = parseInt(m[4], 10);
-      const hr = parseInt(m[5], 10);
-      // 合理範圍檢查
-      if (km >= 1 && km <= 99 && pace >= 120 && pace <= 1500 && hr >= 50 && hr <= 230) {
-        rows.push({ km, pace, elevDelta: elev, hr });
+  // 抽出所有 m:ss 與帶正負號的整數 token，記錄出現順序
+  const tokens = [];
+  const re = /(\d{1,2}:[0-5]\d)|(-?\d{1,3})/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m[1]) tokens.push({ type: 'time', raw: m[1] });
+    else tokens.push({ type: 'int', raw: m[2], val: parseInt(m[2], 10) });
+  }
+
+  const splits = [];
+  let expectedKm = 1;
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    // 找錨點：整數 == expectedKm
+    if (t.type !== 'int' || t.val !== expectedKm) { i++; continue; }
+    // 接著找 pace（m:ss 在合理範圍 2:00-15:00），允許之間夾雜其他 token（容忍少量雜訊）
+    let paceIdx = -1;
+    for (let j = i + 1; j < Math.min(i + 5, tokens.length); j++) {
+      if (tokens[j].type === 'time') {
+        const [a, b] = tokens[j].raw.split(':').map(Number);
+        if (a >= 2 && a <= 15) { paceIdx = j; break; }
+        else { paceIdx = -1; break; } // 怪異 m:ss，放棄此錨點
+      }
+      // 如果撞到下一個整數且看起來像下一個 km 序號就停
+      if (tokens[j].type === 'int' && tokens[j].val === expectedKm + 1) break;
+    }
+    if (paceIdx < 0) { i++; continue; }
+
+    // pace 後到下一個 km# 之間的整數 = elev + hr 的候選
+    let nextKmIdx = -1;
+    for (let j = paceIdx + 1; j < Math.min(paceIdx + 8, tokens.length); j++) {
+      if (tokens[j].type === 'int' && tokens[j].val === expectedKm + 1) {
+        nextKmIdx = j; break;
       }
     }
+    const end = nextKmIdx > 0 ? nextKmIdx : Math.min(paceIdx + 5, tokens.length);
+    const between = [];
+    for (let j = paceIdx + 1; j < end; j++) {
+      if (tokens[j].type === 'int') between.push(tokens[j]);
+    }
+
+    let elev = null, hr = null;
+    if (between.length >= 2) {
+      // 最後一個整數視為 HR（合理範圍 50-230）
+      const last = between[between.length - 1];
+      if (last.val >= 50 && last.val <= 230) hr = last.val;
+      // HR 之前最後一個整數視為 elev（範圍 -999~999）
+      const elevTok = between[between.length - 2];
+      if (Math.abs(elevTok.val) <= 999) elev = elevTok.val;
+    } else if (between.length === 1) {
+      const v = between[0].val;
+      if (v >= 50 && v <= 230) hr = v;
+      else if (Math.abs(v) <= 999) elev = v;
+    }
+
+    const [pm, ps] = tokens[paceIdx].raw.split(':').map(Number);
+    splits.push({
+      km: expectedKm,
+      pace: pm * 60 + ps,
+      elevDelta: elev,
+      hr,
+    });
+    expectedKm++;
+    i = nextKmIdx > 0 ? nextKmIdx : (end);
   }
-  // 去重並依 km 排序（圖可能 OCR 出重複行）
-  const seen = new Set();
-  const uniq = [];
-  rows.sort((a, b) => a.km - b.km);
-  for (const r of rows) {
-    if (seen.has(r.km)) continue;
-    seen.add(r.km);
-    uniq.push(r);
-  }
-  return uniq;
+  return splits;
 }
 
 async function runOcr(files) {
@@ -1111,21 +1199,23 @@ async function runOcr(files) {
 
 function showOcrPreview(parsed) {
   const fields = [
+    { k: 'time', label: '時間', v: parsed.time || '', text: true, type: 'time' },
     { k: 'distance', label: '距離 (km)', v: parsed.distance != null ? parsed.distance : '', step: '0.01' },
     { k: 'duration', label: '移動時間', v: parsed.duration != null ? formatDuration(parsed.duration) : '', text: true },
     { k: 'pace', label: '平均配速 (推算)', v: parsed.pace != null ? formatPace(parsed.pace) : (parsed.distance && parsed.duration ? formatPace(parsed.duration / parsed.distance) : ''), text: true, readonly: true },
     { k: 'elevationGain', label: '爬升海拔 (m)', v: parsed.elevationGain != null ? parsed.elevationGain : '', step: '1' },
     { k: 'maxElevation', label: '最高海拔 (m)', v: parsed.maxElevation != null ? parsed.maxElevation : '', step: '1' },
     { k: 'avgHr', label: '平均心率', v: parsed.avgHr != null ? parsed.avgHr : '', step: '1' },
+    { k: 'route', label: '路線/地點', v: parsed.route || '', text: true },
   ];
   const html = fields.map(f => {
     const got = f.v !== '' && f.v != null;
     const badge = f.readonly ? '' : `<span class="extracted-badge ${got ? '' : 'missing-badge'}">${got ? '✓ 已抓到' : '✗ 未抓到'}</span>`;
-    const inputType = f.text ? 'text' : 'number';
+    const inputType = f.type ? f.type : (f.text ? 'text' : 'number');
     return `
       <div style="margin-bottom:10px;">
         <label>${f.label}${badge}</label>
-        <input type="${inputType}" data-k="${f.k}" value="${f.v}" ${f.step ? `step="${f.step}"` : ''} ${f.readonly ? 'readonly style="opacity:.6;"' : ''} />
+        <input type="${inputType}" data-k="${f.k}" value="${escapeHtml(String(f.v))}" ${f.step ? `step="${f.step}"` : ''} ${f.readonly ? 'readonly style="opacity:.6;"' : ''} />
       </div>
     `;
   }).join('');
@@ -1139,11 +1229,13 @@ function showOcrPreview(parsed) {
     const inputs = $('#ocrFields').querySelectorAll('input[data-k]');
     const data = {};
     inputs.forEach(inp => { data[inp.dataset.k] = inp.value.trim(); });
+    if (data.time) $('#f-time').value = data.time;
     if (data.distance) $('#f-distance').value = data.distance;
     if (data.duration) $('#f-duration').value = data.duration;
     if (data.elevationGain) $('#f-elev-gain').value = data.elevationGain;
     if (data.maxElevation) $('#f-elev-max').value = data.maxElevation;
     if (data.avgHr) $('#f-avg-hr').value = data.avgHr;
+    if (data.route) $('#f-route').value = data.route;
     if (parsed.splits && parsed.splits.length > 0) setSplitsFromArray(parsed.splits);
     updatePacePreview();
     $('#ocrModal').classList.remove('show');
