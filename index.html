@@ -442,6 +442,12 @@
       </div>
       <label>備註</label>
       <textarea id="e-note"></textarea>
+
+      <label style="margin-top:10px;">每公里分段（每行一段：<code>配速 海拔 心率</code>）</label>
+      <textarea id="e-splits-text" rows="8" placeholder="7:30 -5 151
+7:02 -1 157" style="font-family:ui-monospace,Menlo,Consolas,monospace; font-size:14px;"></textarea>
+      <div class="hint">配速可只打數字（<code>730</code> = <code>7:30</code>）。整段欄位空白即清除分段。</div>
+
       <button type="submit" class="primary" style="margin-top:8px;">💾 更新</button>
     </form>
   </div>
@@ -1011,6 +1017,17 @@ function setupEditModal() {
     if (!km || km <= 0) return showToast('請輸入有效距離', 'error');
     if (!sec || sec <= 0) return showToast('時長格式錯誤', 'error');
 
+    const splitsText = $('#e-splits-text').value.trim();
+    let splits = [];
+    if (splitsText) {
+      const parsed = parseBulkSplits(splitsText);
+      splits = parsed.map((r, i) => ({
+        km: i + 1,
+        pace: r.pace,
+        elevDelta: r.elev,
+        hr: r.hr,
+      }));
+    }
     Store.update(id, {
       date: $('#e-date').value,
       time: $('#e-time').value || '',
@@ -1022,6 +1039,7 @@ function setupEditModal() {
       mood: $('#e-mood').value,
       route: $('#e-route').value.trim(),
       note: $('#e-note').value.trim(),
+      splits,
     });
     modal.classList.remove('show');
     showToast('已更新 ✓');
@@ -1043,6 +1061,15 @@ function openEdit(id) {
   $('#e-mood').value = rec.mood || '';
   $('#e-route').value = rec.route || '';
   $('#e-note').value = rec.note || '';
+  // 將分段轉為 bulk 文字格式
+  const splits = Array.isArray(rec.splits) ? rec.splits : [];
+  $('#e-splits-text').value = splits.map(s => {
+    const parts = [];
+    parts.push(s.pace != null ? formatPace(s.pace) : '--');
+    if (s.elevDelta != null) parts.push(s.elevDelta);
+    if (s.hr != null) parts.push(s.hr);
+    return parts.join(' ');
+  }).join('\n');
   $('#editModal').classList.add('show');
 }
 
