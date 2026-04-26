@@ -1342,12 +1342,13 @@ async function runOcr(files) {
     const eh = results.find(r => r.type === 'elev_hr');
     if (kp && eh) {
       // 兩張裁切圖依列序對齊。取行數較多的一邊為長度，缺項補 null。
+      // km# 永遠用列序（1,2,3...），OCR 抓到的 km 多半被誤讀（3→5 等）
       const n = Math.max(kp.rows.length, eh.rows.length);
       for (let i = 0; i < n; i++) {
         const a = kp.rows[i] || {};
         const b = eh.rows[i] || {};
         allSplits.push({
-          km: (a.km != null) ? a.km : (i + 1),
+          km: i + 1,
           pace: a.pace != null ? a.pace : null,
           elevDelta: b.elev != null ? b.elev : null,
           hr: b.hr != null ? b.hr : null,
