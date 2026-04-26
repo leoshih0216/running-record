@@ -1050,12 +1050,13 @@ function parseSummary(text) {
   // 平均心率：xxx bpm
   const hr = text.match(/(\d{2,3})\s*bpm/i);
   if (hr) out.avgHr = parseInt(hr[1], 10);
-  // 海拔：所有 \d+\s*公尺，先找「爬升」「最高」字樣附近的數字
-  const elevGainCtx = text.match(/爬\s*升[^\d]{0,20}(\d{1,4})\s*公?\s*尺/);
-  const elevMaxCtx = text.match(/最\s*高[^\d]{0,20}(\d{1,4})\s*公?\s*尺/);
+  // 海拔：以「爬升」「最高」為錨點，往後跨行尋找「<數字> 公 尺」配對
+  // [^]{0,40}? 是非貪婪，可跳過 Strava label/value 換行間插入的時間 1:14:07
+  const elevGainCtx = text.match(/爬\s*升[^]{0,40}?(\d{1,4})\s*公\s*尺/);
+  const elevMaxCtx = text.match(/最\s*高[^]{0,40}?(\d{1,4})\s*公\s*尺/);
   if (elevGainCtx) out.elevationGain = parseInt(elevGainCtx[1], 10);
   if (elevMaxCtx) out.maxElevation = parseInt(elevMaxCtx[1], 10);
-  if (!out.elevationGain && !out.maxElevation) {
+  if (out.elevationGain == null && out.maxElevation == null) {
     const meters = [...text.matchAll(/(\d+)\s*公\s*尺/g)].map(m => parseInt(m[1], 10));
     if (meters.length >= 2) {
       const sorted = [...meters].sort((a, b) => a - b);
@@ -1069,7 +1070,8 @@ function parseSummary(text) {
   const tt = parseActivityTime(text);
   if (tt) out.time = tt;
   // 路線/地點：「· 龜山區, 桃園市」這類中文行政區
-  const loc = text.match(/[·•・\-]\s*([一-龥]{1,8}(?:區|鄉|鎮|市|縣)(?:\s*[,，]\s*[一-龥]{1,8}(?:市|縣))?)/);
+  // OCR 常在中文字之間插入空格（"血 山區"），允許單字 + 可選空白重複
+  const loc = text.match(/[·•・.\-]\s*((?:[一-龥]\s*){1,16}(?:區|鄉|鎮|市|縣)(?:\s*[,，]\s*(?:[一-龥]\s*){1,16}(?:市|縣))?)/);
   if (loc) out.route = loc[1].replace(/\s+/g, '').replace(/，/g, ', ');
   return out;
 }
